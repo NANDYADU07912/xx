@@ -406,14 +406,16 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                         "is_local": True
                     }
                     
-                    url = await get_youtube_url(id)
-                    metadata = await extract_metadata(url, video) if url else {}
+                    logs.info(f"Database entry created for {stream_id}: {database[stream_id]}")
+                    
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    metadata = await extract_metadata(url, video)
                     
                     return {
                         "id": video_id,
                         "title": metadata.get("title", "Unknown"),
                         "duration": metadata.get("duration", 0),
-                        "link": f"https://www.youtube.com/watch?v={video_id}",
+                        "link": url,
                         "channel": metadata.get("channel", "Unknown"),
                         "views": metadata.get("views", 0),
                         "thumbnail": metadata.get("thumbnail", ""),
