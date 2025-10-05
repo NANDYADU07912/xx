@@ -305,6 +305,11 @@ async def download_with_cookies(url: str, video_id: str, is_video: bool = False)
                         "quiet": True,
                         "no_warnings": True,
                         "cookiefile": cookie_file,
+                        "socket_timeout": 30,
+                        "retries": 3,
+                        "http_headers": {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        }
                     }
                 else:
                     ydl_opts = {
@@ -315,6 +320,11 @@ async def download_with_cookies(url: str, video_id: str, is_video: bool = False)
                         "quiet": True,
                         "no_warnings": True,
                         "cookiefile": cookie_file,
+                        "socket_timeout": 30,
+                        "retries": 3,
+                        "http_headers": {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        }
                     }
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
