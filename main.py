@@ -276,7 +276,7 @@ def save_drive_cache(cache_data):
 # ========== END DRIVE FUNCTIONS ==========
 
 async def download_with_cookies(url: str, video_id: str, is_video: bool = False):
-    """Download using yt-dlp with cookies"""
+    """Download using yt-dlp with cookies - same as your working code"""
     cookie_files = get_cookie_files()
     if not cookie_files:
         logs.error("No cookie files available")
@@ -285,75 +285,98 @@ async def download_with_cookies(url: str, video_id: str, is_video: bool = False)
     download_folder = "downloads"
     os.makedirs(download_folder, exist_ok=True)
     
-    ext = "mp4" if is_video else "mp3"
-    expected_path = f"{download_folder}/{video_id}.{ext}"
+    # Check if file already exists with any extension
+    for ext in ["mp4", "mp3", "m4a", "webm"]:
+        existing_path = f"{download_folder}/{video_id}.{ext}"
+        if os.path.exists(existing_path):
+            logs.info(f"File already exists: {existing_path}")
+            return existing_path
     
-    # Check if already exists
-    if os.path.exists(expected_path):
-        logs.info(f"File already exists: {expected_path}")
-        return expected_path
-    
-    try:
-        if is_video:
-            ydl_opts = {
-                "format": "(bestvideo[height<=?720][width<=?1280][ext=mp4])+(bestaudio[ext=m4a])",
-                "outtmpl": f"{download_folder}/{video_id}.%(ext)s",
-                "quiet": True,
-                "no_warnings": True,
-            }
-        else:
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": f"{download_folder}/{video_id}.%(ext)s",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-                "quiet": True,
-                "no_warnings": True,
-            }
-        
-        # Try each cookie file
+    def sync_download():
+        """Synchronous download function"""
         for cookie_file in cookie_files:
             try:
-                current_opts = ydl_opts.copy()
-                current_opts["cookiefile"] = cookie_file
+                if is_video:
+                    ydl_opts = {
+                        "format": "best[height<=?720][width<=?1280]",
+                        "outtmpl": f"{download_folder}/{video_id}.%(ext)s",
+                        "geo_bypass": True,
+                        "nocheckcertificate": True,
+                        "quiet": True,
+                        "no_warnings": True,
+                        "cookiefile": cookie_file,
+                    }
+                else:
+                    ydl_opts = {
+                        "format": "bestaudio/best",
+                        "outtmpl": f"{download_folder}/{video_id}.%(ext)s",
+                        "geo_bypass": True,
+                        "nocheckcertificate": True,
+                        "quiet": True,
+                        "no_warnings": True,
+                        "cookiefile": cookie_file,
+                    }
                 
-                with yt_dlp.YoutubeDL(current_opts) as ydl:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     logs.info(f"Downloading with cookie: {cookie_file}")
-                    ydl.download([url])
+                    info = ydl.extract_info(url, download=False)
+                    expected_ext = info.get('ext', 'mp4' if is_video else 'mp3')
+                    expected_path = f"{download_folder}/{video_id}.{expected_ext}"
                     
                     if os.path.exists(expected_path):
-                        logs.info(f"Download successful: {expected_path}")
-                        
-                        # Upload to Drive if audio
-                        if not is_video and DRIVE_AVAILABLE:
-                            file_size = os.path.getsize(expected_path)
-                            file_size_mb = file_size / (1024 * 1024)
-                            
-                            if file_size_mb <= 120:
-                                drive_id = upload_to_drive(expected_path, video_id)
-                                if drive_id:
-                                    cache = load_drive_cache()
-                                    cache[video_id] = {
-                                        "drive_file_id": drive_id,
-                                        "uploaded_at": datetime.now().isoformat(),
-                                        "file_size": file_size
-                                    }
-                                    save_drive_cache(cache)
-                                    logs.info(f"Uploaded to Drive: {video_id}")
-                        
+                        logs.info(f"File already exists after check: {expected_path}")
                         return expected_path
+                    
+                    ydl.download([url])
+                    
+                    # Check for downloaded file
+                    if os.path.exists(expected_path):
+                        logs.info(f"Download successful: {expected_path}")
+                        return expected_path
+                    
+                    # Sometimes extension might be different, check all possibilities
+                    for ext in ["mp4", "webm", "mkv", "mp3", "m4a"]:
+                        alt_path = f"{download_folder}/{video_id}.{ext}"
+                        if os.path.exists(alt_path):
+                            logs.info(f"Download successful (alt format): {alt_path}")
+                            return alt_path
                         
             except Exception as e:
                 logs.warning(f"Cookie {cookie_file} failed: {e}")
                 continue
+        
+        return None
+    
+    try:
+        # Run in executor to avoid blocking
+        loop = asyncio.get_running_loop()
+        downloaded_file = await loop.run_in_executor(None, sync_download)
+        
+        if downloaded_file and not is_video and DRIVE_AVAILABLE:
+            # Upload audio to Drive
+            try:
+                file_size = os.path.getsize(downloaded_file)
+                file_size_mb = file_size / (1024 * 1024)
                 
+                if file_size_mb <= 120:
+                    drive_id = upload_to_drive(downloaded_file, video_id)
+                    if drive_id:
+                        cache = load_drive_cache()
+                        cache[video_id] = {
+                            "drive_file_id": drive_id,
+                            "uploaded_at": datetime.now().isoformat(),
+                            "file_size": file_size
+                        }
+                        save_drive_cache(cache)
+                        logs.info(f"Uploaded to Drive: {video_id}")
+            except Exception as e:
+                logs.error(f"Drive upload failed (non-critical): {e}")
+        
+        return downloaded_file
+        
     except Exception as e:
         logs.error(f"Download failed: {e}")
-        
-    return None
+        return None
 
 async def extract_metadata(url: str, video: bool = False):
     """Extract basic metadata"""
