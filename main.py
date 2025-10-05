@@ -380,9 +380,9 @@ def extract_video_id(query: str) -> str:
     return query
 
 @app.get("/youtube")
-async def get_youtube_info(query: str, video: bool = False, user: str = Security(get_user)):
+async def get_youtube_info(id: str, video: bool = False, user: str = Security(get_user)):
     try:
-        video_id = extract_video_id(query)
+        video_id = extract_video_id(id)
         logs.info(f"Processing: {video_id} (video={video})")
         
         # FOR AUDIO ONLY: Check Drive first (YouTube.py logic)
@@ -406,7 +406,7 @@ async def get_youtube_info(query: str, video: bool = False, user: str = Security
                         "is_local": True
                     }
                     
-                    url = await get_youtube_url(query)
+                    url = await get_youtube_url(id)
                     metadata = await extract_metadata(url, video) if url else {}
                     
                     return {
@@ -593,8 +593,12 @@ async def get_youtube_info(query: str, video: bool = False, user: str = Security
 
 @app.get("/stream/{stream_id}")
 async def stream_from_stream_url(stream_id: str):
+    logs.info(f"Stream request for ID: {stream_id}")
+    logs.info(f"Database keys: {list(database.keys())}")
+    
     file_data = database.get(stream_id)
     if not file_data:
+        logs.error(f"Stream ID {stream_id} not found in database")
         return {"error": "Invalid stream request!"}
 
     # Local file streaming
