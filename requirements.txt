@@ -1,0 +1,27 @@
+# FastAPI and Server
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+
+# HTTP Clients
+aiohttp==3.9.1
+httpx==0.25.2
+
+# YouTube Downloading
+yt-dlp==2023.11.16
+
+# YouTube Search - Git Clone Installation
+git+https://github.com/alexmercerind/youtube-search-python.git
+
+# Google Drive Integration
+google-auth==2.25.2
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.110.0
+
+# Telegram Bot (if needed)
+pyrogram==2.0.106
+TgCrypto==1.2.5
+
+# Utilities
+python-dotenv==1.0.0
