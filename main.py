@@ -352,6 +352,8 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                     stream_url = f"http://{ip}:8000/stream/{stream_id}"
                     
                     database[stream_id] = {"file_path": local_path, "file_name": os.path.basename(local_path), "is_local": True}
+                    logs.info(f"Database set for {stream_id}: local file")
+                    logs.info(f"Total database entries: {len(database)}")
                     
                     url = f"https://www.youtube.com/watch?v={video_id}"
                     metadata = await extract_metadata(url, video)
@@ -501,8 +503,13 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
 
 @app.get("/stream/{stream_id}")
 async def stream_from_stream_url(stream_id: str):
+    logs.info(f"Stream request: {stream_id}")
+    logs.info(f"Database has {len(database)} entries")
+    
     file_data = database.get(stream_id)
     if not file_data:
+        logs.error(f"Stream ID not found: {stream_id}")
+        logs.error(f"Available IDs: {list(database.keys())}")
         return {"error": "Invalid stream request!"}
 
     if file_data.get("is_local"):
