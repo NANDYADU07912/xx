@@ -380,6 +380,8 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                     stream_url = f"http://{ip}:8000/stream/{stream_id}"
                     
                     database[stream_id] = {"file_path": local_path, "file_name": f"{video_id}.mp3", "is_local": True}
+                    logs.info(f"Database set for {stream_id}: drive file")
+                    logs.info(f"Total database entries: {len(database)}")
                     
                     url = f"https://www.youtube.com/watch?v={video_id}"
                     metadata = await extract_metadata(url, video)
@@ -404,10 +406,11 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
         
         url = await get_youtube_url(id)
         metadata = await extract_metadata(url, video)
+        
         if not metadata:
-            return {}
+            logs.error(f"Metadata extraction failed for {video_id}")
+            return {"error": "Could not fetch video info"}
 
-        extention = "mp3" if not video else "mp4"  
         file_url = metadata.get("stream_url")
         
         if file_url:
@@ -416,6 +419,8 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             stream_id = await new_uid()  
             stream_url = f"http://{ip}:8000/stream/{stream_id}"  
             database[stream_id] = {"file_url": file_url, "file_name": file_name, "is_local": False}  
+            logs.info(f"Database set for {stream_id}: stream URL")
+            logs.info(f"Total database entries: {len(database)}")
 
             return {  
                 "id": metadata.get("id"),  
@@ -481,6 +486,8 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                 stream_url = f"http://{ip}:8000/stream/{stream_id}"
                 
                 database[stream_id] = {"file_path": downloaded_file, "file_name": os.path.basename(downloaded_file), "is_local": True}
+                logs.info(f"Database set for {stream_id}: downloaded file")
+                logs.info(f"Total database entries: {len(database)}")
                 
                 return {
                     "id": video_id,
