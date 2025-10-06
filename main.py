@@ -1,16 +1,16 @@
 import os
 import io
+import re
 import json
-import glob
 import time
 import uuid
+import glob
 import logging
 import asyncio
 import httpx
 import yt_dlp
 import aiohttp
 import uvicorn
-from datetime import datetime
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.responses import StreamingResponse
 from fastapi.security.api_key import APIKeyQuery
@@ -20,6 +20,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from google.auth.transport.requests import Request
 
 # ----------------- Logging -----------------
 logging.basicConfig(
@@ -262,16 +263,13 @@ def save_metadata_to_drive():
         init_drive_service()
     try:
         fh = io.BytesIO(json.dumps(metadata, indent=2).encode())
-        # Check if metadata file exists
         results = drive_service.files().list(q=f"name='{METADATA_DRIVE_FILENAME}'", spaces='drive',
                                              fields="files(id,name)").execute()
         files = results.get('files',[])
         media = MediaIoBaseUpload(fh, mimetype="application/json", resumable=True)
         if files:
-            # update
             drive_service.files().update(fileId=files[0]['id'], media_body=media).execute()
         else:
-            # create
             file_metadata = {'name': METADATA_DRIVE_FILENAME,'parents':[DRIVE_FOLDER_ID] if DRIVE_FOLDER_ID else []}
             drive_service.files().create(body=file_metadata, media_body=media).execute()
         logs.info("Metadata saved to Drive")
@@ -291,7 +289,7 @@ async def upload_file_to_drive(file_path:str):
         logs.error(f"Drive upload error: {e}")
         return None
 
-# ----------------- API Endpoints -----------------
+# ----------------- YouTube API Endpoint -----------------
 @app.get("/youtube")
 async def get_youtube_info(id: str, video: bool = False, user: str = Security(get_user)):
     start_time = time.time()
@@ -303,22 +301,58 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
         if cached.get("expiry_time",0)>time.time():
             logs.info(f"Returning cached response for ID:{video_id}")
             return cached["response"]
-    # Audio: check metadata (Drive)
-    source="yt_dlp"
-    file_url=None
-    file_name=None
+
+    source = "yt_dlp"
+    file_url = None
+    file_name = None
+
+    # ----------------- Audio from Drive -----------------
     if not video and video_id in metadata:
         file_id = metadata[video_id]["drive_file_id"]
-        file_url=f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-        file_name=f"{video_id}.{metadata[video_id].get('format','mp3')}"
-        source="drive"
-        logs.info(f"Serving from Drive: {video_id}")
-        # Create response
-        ip = await get_public_ip()
-        stream_id = await new_uid()
-        stream_url = f"http://{ip}:8000/stream/{stream_id}"
-        database[stream_id] = {"file_url":file_url,"file_name":file_name,"created_time":time.time()}
-        response_data = {
+        file_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        file_name = f"{video_id}.{metadata[video_id].get('format','mp3')}"
+        source = "drive"
+
+    # ----------------- Otherwise fetch via yt-dlp -----------------
+    if file_url is None:
+        url = await asyncio.wait_for(get_youtube_url(video_id), timeout=12)
+        if not url:
+            return {"error": "Invalid YouTube ID"}
+        meta = await asyncio.wait_for(extract_metadata(url, video), timeout=12)
+        if not meta or not meta.get("stream_url"):
+            return {"error": "Could not fetch stream URL"}
+
+        file_url = meta["stream_url"]
+        file_name = f"{meta['id']}.{'mp4' if video else 'mp3'}"
+
+        # If audio, upload to Drive + metadata update
+        if not video:
+            temp_file = f"/tmp/{file_name}"
+            # Download temporarily
+            ydl_opts = {
+                "format":"bestaudio/best",
+                "outtmpl":temp_file,
+                "quiet":True
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            drive_file_id = await upload_file_to_drive(temp_file)
+            os.remove(temp_file)
+            if drive_file_id:
+                metadata[video_id] = {
+                    "drive_file_id": drive_file_id,
+                    "uploaded_at": datetime.utcnow().isoformat(),
+                    "format":"mp3",
+                    "file_size": os.path.getsize(temp_file) if os.path.exists(temp_file) else 0,
+                    "title": meta["title"]
+                }
+                save_metadata_to_drive()
+                source="yt_dlp"
+
+        meta["source"]=source
+        meta["stream_url"]=file_url
+    else:
+        meta = {
             "id": video_id,
             "title": metadata[video_id]["title"],
             "duration": metadata[video_id].get("duration"),
@@ -326,8 +360,48 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             "channel": metadata[video_id].get("channel","Unknown"),
             "views": metadata[video_id].get("views"),
             "thumbnail": metadata[video_id].get("thumbnail"),
-            "stream_url": stream_url,
+            "stream_url": file_url,
             "stream_type":"Audio",
             "source":source
         }
-        cache_db[cache_key] = {"response":response_data,"expiry
+
+    ip = await get_public_ip()
+    stream_id = await new_uid()
+    stream_url = f"http://{ip}:8000/stream/{stream_id}"
+    database[stream_id] = {"file_url":file_url,"file_name":file_name,"created_time":time.time()}
+
+    response_data = meta.copy()
+    response_data["stream_url"]=stream_url
+
+    cache_db[cache_key]={"response":response_data,"expiry_time":meta.get("expiry_time",time.time()+3600)}
+    return response_data
+
+# ----------------- Stream Endpoint -----------------
+@app.get("/stream/{stream_id}")
+async def stream_from_stream_url(stream_id: str):
+    file_data = database.get(stream_id)
+    if not file_data or not file_data.get("file_url") or not file_data.get("file_name"):
+        return {"error":"Invalid stream request!"}
+    streamer = Streamer()
+    headers={"Content-Disposition":f"attachment; filename=\"{file_data.get('file_name')}\""}
+    return StreamingResponse(streamer.stream_file(file_data.get("file_url")),
+                             media_type="application/octet-stream", headers=headers)
+
+# ----------------- Cleanup Old Streams -----------------
+async def cleanup_old_streams():
+    while True:
+        await asyncio.sleep(3600)
+        current_time = time.time()
+        expired_streams = [sid for sid,data in database.items() if data.get("created_time",0)+7200<current_time]
+        for sid in expired_streams:
+            del database[sid]
+            logs.info(f"Cleaned up old stream: {sid}")
+
+@app.on_event("startup")
+async def startup_event():
+    init_drive_service()
+    download_metadata_from_drive()
+    asyncio.create_task(cleanup_old_streams())
+
+if __name__=="__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
