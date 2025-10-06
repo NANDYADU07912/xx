@@ -6,7 +6,6 @@ from logging.handlers import RotatingFileHandler
 from youtubesearchpython.__future__ import VideosSearch
 
 # --- Google Drive Imports ---
-# NOTE: pydrive2 handles file cache issue better than older google-api-python-client versions.
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from google.auth.transport.requests import Request
@@ -40,6 +39,7 @@ logging.basicConfig(
 logging.getLogger("asyncio").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("googleapiclient").setLevel(logging.WARNING) # Suppress Drive API logs
+logging.getLogger("google.auth").setLevel(logging.WARNING) # Suppress google auth logs
 
 logs = logging.getLogger(__name__)
 # ---------------------
@@ -64,35 +64,42 @@ drive_service = None
 # --- Drive Functions ---
 
 def load_drive_credentials():
-    """Authenticates with Google Drive and returns the GoogleDrive object."""
+    """
+    Authenticates with Google Drive, handling token refresh automatically. 
+    Returns the GoogleDrive object.
+    """
     global drive, gauth, drive_service
+    creds = None
     try:
-        gauth = GoogleAuth()
-        
-        # Try to load saved credentials
+        # 1. Try to load saved credentials from token.json
         if os.path.exists(TOKEN_PATH):
             creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-        else:
-            creds = None
 
+        # 2. Handle expired token using refresh token
+        if creds and creds.expired and creds.refresh_token:
+            logs.info("Access token expired. Attempting to refresh token...")
+            creds.refresh(Request()) # <-- REFRESH TOKEN LOGIC HERE
+
+        # 3. Handle no credentials or invalid credentials (initial/expired refresh token)
         if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+            if os.path.exists(CLIENT_SECRET_PATH):
+                logs.info("No valid token found. Starting interactive OAuth flow.")
                 flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_PATH, SCOPES)
-                # Note: Run this interactively once to create token.json
-                # For non-interactive deployment, you need to manually handle the flow
+                # Note: This requires a web browser interaction on the first run.
                 creds = flow.run_local_server(port=0) 
+            else:
+                logs.error(f"Client secret not found at {CLIENT_SECRET_PATH}. Cannot authenticate.")
+                return False
             
-            # Save the credentials for the next run
+            # Save the new credentials (which includes the refresh token)
             with open(TOKEN_PATH, 'w') as token:
                 token.write(creds.to_json())
+            logs.info(f"New credentials saved to {TOKEN_PATH}.")
 
-        # Set credentials for pydrive2
+        # 4. Setup global objects
+        gauth = GoogleAuth()
         gauth.credentials = creds
         drive = GoogleDrive(gauth)
-        
-        # Build the service for more direct API calls (like downloading chunks)
         drive_service = build('drive', 'v3', credentials=creds)
 
         logs.info("Google Drive authentication successful.")
@@ -103,6 +110,8 @@ def load_drive_credentials():
 
 def get_metadata_file_id() -> str | None:
     """Searches for the metadata file in Drive."""
+    if not drive:
+        return None
     try:
         file_list = drive.ListFile({'q': f"title='{METADATA_DRIVE_FILENAME}' and trashed=false"}).GetList()
         if file_list:
@@ -114,6 +123,8 @@ def get_metadata_file_id() -> str | None:
 def download_metadata_from_drive(file_id: str):
     """Downloads and loads the metadata from Drive."""
     global metadata_db
+    if not drive:
+        return
     try:
         logs.info(f"Downloading metadata file: {file_id}")
         file = drive.CreateFile({'id': file_id})
@@ -126,6 +137,8 @@ def download_metadata_from_drive(file_id: str):
 
 def upload_file_to_drive(local_path: str, title: str) -> tuple[str | None, int]:
     """Uploads a file to Drive and returns its ID and size."""
+    if not drive:
+        return None, 0
     try:
         logs.info(f"Starting upload of {title} to Google Drive...")
         
@@ -145,9 +158,12 @@ def upload_file_to_drive(local_path: str, title: str) -> tuple[str | None, int]:
         logs.error(f"Error uploading file to Drive: {e}")
         return None, 0
 
-def update_metadata_on_drive(metadata_file_id: str | None, new_metadata: dict):
+def update_metadata_on_drive(metadata_file_id: str | None, new_metadata: dict) -> str | None:
     """Updates the in-memory metadata and uploads it back to Drive."""
     global metadata_db
+    if not drive:
+        return None
+        
     metadata_db.update(new_metadata)
 
     try:
@@ -161,7 +177,12 @@ def update_metadata_on_drive(metadata_file_id: str | None, new_metadata: dict):
             logs.info("Successfully updated existing metadata file on Drive.")
         else:
             # Create new file
-            file = drive.CreateFile({'title': METADATA_DRIVE_FILENAME})
+            file_metadata = {'title': METADATA_DRIVE_FILENAME}
+            # If DRIVE_FOLDER_ID is set, put the metadata file there too
+            if DRIVE_FOLDER_ID:
+                file_metadata['parents'] = [{'id': DRIVE_FOLDER_ID}]
+                
+            file = drive.CreateFile(file_metadata)
             file.SetContentString(json_content)
             file.Upload()
             logs.info("Successfully created new metadata file on Drive.")
@@ -171,7 +192,7 @@ def update_metadata_on_drive(metadata_file_id: str | None, new_metadata: dict):
         logs.error(f"Error updating metadata on Drive: {e}")
         return None
 
-# --- Core API Functions (Unchanged) ---
+# --- Core API Functions (Unchanged from previous response) ---
 async def get_user(api_key: str = Security(api_key_query)):
     if api_key == API_KEY:
         return "user"
@@ -194,11 +215,9 @@ async def get_public_ip() -> str:
 
 def extract_video_id(query: str) -> str:
     """Extract YouTube video ID from various URL formats or return as is"""
-    # If it's already an 11-character YouTube ID
     if re.match(r'^[A-Za-z0-9_-]{11}$', query):
         return query
     
-    # Try to extract from YouTube URLs
     patterns = [
         r'(?:v=|/(?:embed|v|shorts|live)/|youtu.be/)([A-Za-z0-9_-]{11})',
         r'youtube.com/watch\?v=([A-Za-z0-9_-]{11})',
@@ -246,9 +265,13 @@ async def extract_metadata_and_download(url: str, video: bool = False):
     cookie_files = get_cookie_files()
     temp_filename = None
     
-    # Only download for audio requests
     if not video:
-        temp_filename = f"{uuid.uuid4()}.temp"
+        temp_filename = f"temp_{uuid.uuid4()}" # Use a prefix to avoid name clashes
+        temp_dir = "temp_downloads"
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+        temp_filename = os.path.join(temp_dir, temp_filename)
+
 
     def sync_extract_metadata_and_download():  
         ydl_opts = {  
@@ -260,14 +283,12 @@ async def extract_metadata_and_download(url: str, video: bool = False):
             "extract_flat": True,  
             "force_generic_extractor": True,  
             "ignoreerrors": True,
-            "skip_download": video, # Skip download for video
+            "skip_download": video, 
         }
         
         if not video and temp_filename:
-            ydl_opts["outtmpl"] = temp_filename
-            ydl_opts["skip_download"] = False # Do download for audio
-            # yt-dlp might use bestaudio format which is often webm or m4a. 
-            # We'll rely on the actual downloaded extension later if needed.
+            ydl_opts["outtmpl"] = temp_filename + ".%(ext)s" # yt-dlp will add the extension
+            ydl_opts["skip_download"] = False 
         
         # Try each cookie file until one works
         for cookie_file in cookie_files:
@@ -277,7 +298,7 @@ async def extract_metadata_and_download(url: str, video: bool = False):
                 
                 with yt_dlp.YoutubeDL(current_ydl_opts) as ydl:  
                     metadata = ydl.extract_info(url, download=(not video))
-                    if metadata and metadata.get('url') and (video or os.path.exists(temp_filename)):
+                    if metadata and (video or 'url' in metadata): # Use 'url' as a strong indicator of streamability for video
                         logging.info(f"Successfully used cookie file: {cookie_file}")
                         return metadata
             except Exception as e:
@@ -296,14 +317,13 @@ async def extract_metadata_and_download(url: str, video: bool = False):
     metadata = await loop.run_in_executor(None, sync_extract_metadata_and_download)  
 
     if metadata:  
-        # Find the actual downloaded file path for audio
         if not video and temp_filename:
-            downloaded_files = glob.glob(f"{os.path.splitext(temp_filename)[0]}.*")
+            # Find the actual downloaded file path for audio
+            downloaded_files = glob.glob(f"{temp_filename}.*")
             actual_file_path = downloaded_files[0] if downloaded_files else None
         else:
             actual_file_path = None
         
-        # Determine stream_url for non-audio (yt-dlp stream) or None for audio (downloaded)
         stream_url = metadata.get("url") if video else None
         
         return {  
@@ -333,21 +353,37 @@ async def cleanup_expired_cache():
     for key in expired_keys:
         del cache_db[key]
         logs.info(f"Removed expired cache for ID: {key}")
+        
+def cleanup_local_file(file_path):
+    """Synchronously delete a file"""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            logs.info(f"Cleaned up local file: {file_path}")
+    except Exception as e:
+        logs.error(f"Failed to clean up local file {file_path}: {e}")
 
-# --- Streamer Class (Modified for Drive) ---
+# --- Streamer Class (Used for both Drive and YT-DLP URL) ---
 class Streamer:
     def __init__(self):
         self.chunk_size = 1 * 1024 * 1024
 
-    async def get_total_chunks(self, file_url=None, drive_file_id=None, file_size=None):
-        if drive_file_id and file_size:
+    async def get_total_chunks(self, file_url=None, file_size=None):
+        if file_size:
+            # For Drive streams, file_size is pre-determined
             return (int(file_size) + self.chunk_size - 1) // self.chunk_size
         
         if file_url:
+            # For YT-DLP URL streams, use HEAD request
             async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.head(file_url)  
-                file_size = response.headers.get("Content-Length")  
-                return (int(file_size) + self.chunk_size - 1) // self.chunk_size if file_size else None  
+                try:
+                    response = await client.head(file_url, follow_redirects=True)
+                    response.raise_for_status()
+                    file_size = response.headers.get("Content-Length")  
+                    return (int(file_size) + self.chunk_size - 1) // self.chunk_size if file_size else None
+                except Exception as e:
+                    logs.warning(f"Failed to get Content-Length for streaming URL: {e}")
+                    return None
         return None
 
     async def fetch_chunk(self, file_url=None, drive_file_id=None, chunk_id=0):  
@@ -359,6 +395,17 @@ class Streamer:
             loop = asyncio.get_running_loop()
             def sync_drive_download():
                 request = drive_service.files().get_media(fileId=drive_file_id)
+                # Google Drive v3 API does not fully support range headers for direct media download. 
+                # We will rely on getting the full file chunk-by-chunk using a download manager
+                # with the Content-Length passed in database.
+                
+                # NOTE: Since Range headers are tricky with Drive v3 media download, 
+                # for robustness and to respect range headers, we'll try to explicitly set them, 
+                # but might receive the full chunk if not supported.
+                
+                # We will use the Range header for file chunks but if it fails, the initial download will work
+                # If the size is known, we can request chunks. 
+                
                 request.headers['Range'] = f'bytes={start_byte}-{end_byte}'
                 
                 fh = BytesIO()
@@ -366,6 +413,7 @@ class Streamer:
                 done = False
                 while not done:
                     status, done = downloader.next_chunk()
+                    # We rely on the downloader to respect the Range header if possible
                 return fh.getvalue()
 
             try:
@@ -387,9 +435,9 @@ class Streamer:
         return None
 
     async def stream_file(self, file_url=None, drive_file_id=None, file_size=None):  
-        # Use one of the streaming methods
+        
         if drive_file_id:
-            total_chunks = await self.get_total_chunks(drive_file_id=drive_file_id, file_size=file_size)
+            total_chunks = await self.get_total_chunks(file_size=file_size)
             stream_func = lambda cid: self.fetch_chunk(drive_file_id=drive_file_id, chunk_id=cid)
         elif file_url:
             total_chunks = await self.get_total_chunks(file_url=file_url)
@@ -397,31 +445,30 @@ class Streamer:
         else:
             return
 
-        received_chunks = set()  
         chunk_id = 0  
         
-        # Simple streaming loop (not fully optimized for parallel but safer)
+        # Simple streaming loop
         while total_chunks is None or chunk_id < total_chunks:  
             current_chunk = await stream_func(chunk_id)
             if current_chunk:
-                received_chunks.add(chunk_id)
                 yield current_chunk
             else:
-                # If a chunk fails, try to skip it or break if total_chunks is known
-                if total_chunks is not None:
-                    logs.warning(f"Failed to fetch chunk {chunk_id}. Skipping.")
-                elif chunk_id > 10: # Stop trying to stream if too many initial chunks fail
+                # If a chunk fails and we know the total, it might be the end.
+                if total_chunks is not None and chunk_id >= total_chunks -1:
                     break
+                logs.warning(f"Failed to fetch chunk {chunk_id}.")
+                
             
             chunk_id += 1
-            # Add a small delay for large files to prevent overwhelming the source
-            if not drive_file_id: # Only for yt-dlp URL streaming
-                await asyncio.sleep(0.001)
+            await asyncio.sleep(0.001)
 
-# --- API Endpoints (Modified) ---
+
+# --- API Endpoints ---
 @app.get("/youtube")
 async def get_youtube_info(id: str, video: bool = False, user: str = Security(get_user)):
     start_time = time.time()
+    
+    local_file_to_cleanup = None # To track the temporary audio file
     
     try:
         await cleanup_expired_cache()
@@ -431,7 +478,7 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
         source = "yt-dlp"
         drive_metadata = metadata_db.get(video_id)
         
-        if not video and drive_metadata:
+        if not video and drive_metadata and drive_service:
             logs.info(f"Found audio in Drive metadata for ID: {video_id}. Streaming from Drive.")
             
             # --- Stream from Drive ---
@@ -439,25 +486,26 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             stream_id = await new_uid()  
             stream_url = f"http://{ip}:8000/stream/{stream_id}"
             extension = drive_metadata.get("format", "mp3")
-
+            
+            # Store Drive info for streaming
             database[stream_id] = {
                 "drive_file_id": drive_metadata["drive_file_id"], 
                 "file_name": f"{video_id}.{extension}",
-                "file_size": drive_metadata["file_size"],
+                "file_size": drive_metadata.get("file_size"), # Use file_size from metadata
                 "created_time": time.time()
             }
             
             response_data = {  
                 "id": video_id,  
                 "title": drive_metadata.get("title", "Unknown"),  
-                "duration": None, # Duration is not stored in your example metadata
+                "duration": drive_metadata.get("duration"), # If duration is later added
                 "link": f"https://www.youtube.com/watch?v={video_id}",  
                 "channel": "Unknown",  
                 "views": None,  
                 "thumbnail": None,  
                 "stream_url": stream_url,  
                 "stream_type": "Audio",
-                "source": "Drive" # Source added
+                "source": "Drive" 
             }
             
             elapsed_time = time.time() - start_time
@@ -477,11 +525,13 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             return {"error": "Invalid YouTube ID"}
         
         metadata, local_file_path = await asyncio.wait_for(
-            extract_metadata_and_download(url, video), timeout=30 # Increased timeout for download
+            extract_metadata_and_download(url, video), timeout=30 
         )
         
         if not metadata or (video and not metadata.get("stream_url")):
             return {"error": "Could not fetch stream URL or download audio"}
+        
+        local_file_to_cleanup = local_file_path
         
         # --- Handle Audio Upload and Stream URL ---
         file_url = metadata.get("stream_url")
@@ -501,42 +551,32 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                         "uploaded_at": time.time(),
                         "format": file_extension,
                         "file_size": file_size,
-                        "title": metadata.get("title", "Unknown")
+                        "title": metadata.get("title", "Unknown"),
+                        "duration": metadata.get("duration")
                     }
                 }
                 logs.info(f"Updating metadata for ID: {video_id}")
-                metadata_file_id = get_metadata_file_id()
+                metadata_file_id = await asyncio.get_running_loop().run_in_executor(None, get_metadata_file_id)
                 await asyncio.get_running_loop().run_in_executor(
                     None, update_metadata_on_drive, metadata_file_id, new_entry
                 )
                 
-                # Cleanup local file
-                os.remove(local_file_path)
-                logs.info(f"Cleaned up local file: {local_file_path}")
-                
-                # Use Drive details for streaming in the next request (or for current if we adapt)
-                # For simplicity, we'll return a YT-DLP generated stream URL *this time* if available,
-                # but the Drive entry ensures it's used next time.
-                # However, your requirement says: "direct drive se stream ho jayega" -> use drive URL now.
-                
+                # Setup response for streaming from Drive (since it's uploaded now)
                 ip = await get_public_ip()  
                 stream_id = await new_uid()  
                 stream_url = f"http://{ip}:8000/stream/{stream_id}"
                 
-                # Store Drive info for streaming
                 database[stream_id] = {
                     "drive_file_id": drive_id, 
                     "file_name": f"{video_id}.{file_extension}",
                     "file_size": file_size,
                     "created_time": time.time()
                 }
-                source = "yt-dlp (Uploaded to Drive)" # Indicate it was a fresh fetch/upload
+                source = "yt-dlp (Uploaded to Drive)" 
                 
             else:
-                # Fallback: Use the YT-DLP stream URL if download was successful but upload failed.
-                # Since we don't have the temporary stream URL, we'll mark this as a failure for streaming this time.
-                # You might need to re-extract for a direct stream URL if you want a fallback.
-                return {"error": "Failed to upload to Drive and cannot get temporary stream URL"}
+                # If upload failed, the stream will be broken for this audio request
+                return {"error": "Failed to upload to Drive"}
 
         # --- Handle Video (YT-DLP Stream) ---
         elif video:
@@ -565,7 +605,7 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             "thumbnail": metadata.get("thumbnail"),  
             "stream_url": stream_url,  
             "stream_type": metadata.get("stream_type"),
-            "source": source # Source added
+            "source": source 
         }
         
         # Cache the response for direct yt-dlp streams (mainly video)
@@ -581,50 +621,67 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
         return response_data
             
     except asyncio.TimeoutError:
-        logs.error("Request timeout - taking more than 30 seconds")
+        logs.error("Request timeout - taking too long")
         return {"error": "Request timeout - taking too long"}
     except Exception as e:  
         logs.error(f"Error fetching YouTube info: {e}")  
         return {"error": "Something went wrong"}
+    finally:
+        # Cleanup the temporary local audio file if it exists
+        if local_file_to_cleanup:
+            await asyncio.get_running_loop().run_in_executor(None, cleanup_local_file, local_file_to_cleanup)
+
 
 @app.get("/stream/{stream_id}")
 async def stream_from_stream_url(stream_id: str):
     file_data = database.get(stream_id)
     if not file_data:
-        return {"error": "Invalid stream request!"}
+        raise HTTPException(status_code=404, detail="Invalid stream request!")
 
     streamer = Streamer()
     
     file_url = file_data.get("file_url")
     drive_file_id = file_data.get("drive_file_id")
     file_name = file_data.get("file_name", "stream_file")
-    file_size = file_data.get("file_size") # Used for Drive streaming
+    file_size = file_data.get("file_size")
+
+    # Determine media type based on file extension
+    extension = os.path.splitext(file_name)[1].lower().lstrip('.')
+    media_type = "application/octet-stream"
+    if extension in ["mp3", "m4a"]:
+        media_type = f"audio/{extension}"
+    elif extension in ["mp4", "webm"]:
+        media_type = f"video/{extension}"
 
     try:  
-        headers = {"Content-Disposition": f"attachment; filename=\"{file_name}\""}  
+        headers = {
+            "Content-Disposition": f"attachment; filename=\"{file_name}\"",
+            "Accept-Ranges": "bytes"
+        }
         
-        if drive_file_id:
-            # Stream from Google Drive
+        if file_size:
+            headers["Content-Length"] = str(file_size)
+        
+        if drive_file_id and drive_service:
             logs.info(f"Streaming from Drive ID: {drive_file_id}")
             return StreamingResponse(  
                 streamer.stream_file(drive_file_id=drive_file_id, file_size=file_size),  
-                media_type="application/octet-stream",  
+                media_type=media_type,  
                 headers=headers  
             )
         elif file_url:
-            # Stream from YT-DLP URL
             logs.info(f"Streaming from YT-DLP URL")
             return StreamingResponse(  
                 streamer.stream_file(file_url=file_url),  
-                media_type="application/octet-stream",  
+                media_type=media_type,  
                 headers=headers  
             )
         else:
-            return {"error": "No stream source found for this ID."}
+            raise HTTPException(status_code=500, detail="No stream source found for this ID.")
 
     except Exception as e:  
         logging.error(f"Stream Error: {e}")  
-        return {"error": "Something went wrong!"}
+        raise HTTPException(status_code=500, detail="Something went wrong during streaming!")
 
 # Background task to clean up old stream entries
 async def cleanup_old_streams():
@@ -642,12 +699,17 @@ async def cleanup_old_streams():
 
 @app.on_event("startup")
 async def startup_event():
-    # Load Drive credentials and metadata synchronously on startup
+    # 1. Ensure temp folder for downloads exists
+    if not os.path.exists("temp_downloads"):
+        os.makedirs("temp_downloads")
+        
+    # 2. Load Drive credentials and metadata synchronously on startup
     if load_drive_credentials():
         metadata_file_id = await asyncio.get_running_loop().run_in_executor(None, get_metadata_file_id)
         if metadata_file_id:
             await asyncio.get_running_loop().run_in_executor(None, download_metadata_from_drive, metadata_file_id)
 
+    # 3. Start background cleanup task
     asyncio.create_task(cleanup_old_streams())
 
 if __name__ == "__main__":
@@ -655,7 +717,4 @@ if __name__ == "__main__":
     if not os.path.exists("cookies"):
         os.makedirs("cookies")
         
-    # NOTE: The first run will require interactive authentication to create 'token.json'
-    # if it doesn't exist and 'client_secret.json' is present.
-    # Uvicorn run
     uvicorn.run(app, host="0.0.0.0", port=8000)
