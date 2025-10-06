@@ -58,7 +58,7 @@ async def get_public_ip() -> str:
     if ip_address.get("ip_address"):
         return ip_address["ip_address"]
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        async with httpx.AsyncClient(timeout=3) as client:
             response = await client.get('https://api.ipify.org')
             public_ip = response.text
             ip_address["ip_address"] = public_ip
@@ -66,15 +66,30 @@ async def get_public_ip() -> str:
     except:
         return "localhost"
 
-async def get_youtube_url(video_id: str) -> str:
-    if bool(re.match(r'^(https?://)?(www.)?(youtube.com|youtu.be)/(?:watch?v=|embed/|v/|shorts|live/)?([A-Za-z0-9_-]{11})(?:[?&].*)?$', video_id)):
-        match = re.search(r'(?:v=|/(?:embed|v|shorts|live)/|youtu.be/)([A-Za-z0-9_-]{11})', video_id)
+def extract_video_id(query: str) -> str:
+    if re.match(r'^[A-Za-z0-9_-]{11}$', query):
+        return query
+    
+    patterns = [
+        r'(?:v=|/(?:embed|v|shorts|live)/|youtu.be/)([A-Za-z0-9_-]{11})',
+        r'youtube.com/watch\?v=([A-Za-z0-9_-]{11})',
+        r'youtu.be/([A-Za-z0-9_-]{11})'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, query)
         if match:
-            return f"https://www.youtube.com/watch?v={match.group(1)}"
+            return match.group(1)
+    
+    return query
 
+async def get_youtube_url(video_id: str) -> str:
+    if re.match(r'^[A-Za-z0-9_-]{11}$', video_id):
+        return f"https://www.youtube.com/watch?v={video_id}"
+    
     try:  
         search = VideosSearch(video_id, limit=1)  
-        result = await search.next()  
+        result = await asyncio.wait_for(search.next(), timeout=10)
         return result["result"][0]["link"]  
     except Exception:  
         return ""
@@ -134,7 +149,6 @@ def get_drive_service():
         return None
 
 def load_metadata():
-    """Load metadata from api_metadata.json"""
     if not os.path.exists(METADATA_FILE):
         return {}
     try:
@@ -145,7 +159,6 @@ def load_metadata():
         return {}
 
 def save_metadata(metadata):
-    """Save metadata to api_metadata.json"""
     try:
         with open(METADATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -155,7 +168,6 @@ def save_metadata(metadata):
         return False
 
 def download_from_drive(drive_file_id, dest_path):
-    """Download file from Google Drive"""
     service = get_drive_service()
     if not service:
         return False
@@ -177,7 +189,6 @@ def download_from_drive(drive_file_id, dest_path):
         return False
 
 def upload_to_drive(file_path, video_id, file_format):
-    """Upload file to Google Drive"""
     service = get_drive_service()
     if not service or not os.path.exists(file_path):
         return None
@@ -204,7 +215,6 @@ def upload_to_drive(file_path, video_id, file_format):
         return None
 
 async def extract_metadata(url: str, video: bool = False):
-    """Extract metadata from YouTube URL"""
     if not url:
         return {}
 
@@ -218,8 +228,9 @@ async def extract_metadata(url: str, video: bool = False):
             "simulate": True,  
             "quiet": True,  
             "noplaylist": True,  
-            "extract_flat": False,  
+            "extract_flat": True,  
             "skip_download": True,  
+            "force_generic_extractor": True,  
             "ignoreerrors": True,
         }  
 
@@ -257,71 +268,17 @@ async def extract_metadata(url: str, video: bool = False):
             "views": metadata.get("view_count"),  
             "thumbnail": metadata.get("thumbnail"),  
             "stream_url": metadata.get("url"),
-            "ext": metadata.get("ext", "mp3"),
+            "ext": metadata.get("ext", "mp3" if not video else "mp4"),
             "stream_type": "Video" if video else "Audio",  
         }  
 
     return {}
-
-async def download_audio_with_ytdlp(url, video_id, cookie_files):
-    """Download audio using yt-dlp with cookies"""
-    download_folder = "downloads"
-    os.makedirs(download_folder, exist_ok=True)
-    
-    def sync_download():
-        for cookie_file in cookie_files:
-            try:
-                ydl_opts = {
-                    "format": "bestaudio/best",
-                    "outtmpl": f"{download_folder}/{video_id}.%(ext)s",
-                    "geo_bypass": True,
-                    "nocheckcertificate": True,
-                    "quiet": True,
-                    "no_warnings": True,
-                    "cookiefile": cookie_file,
-                    "postprocessors": [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }] if os.path.exists('/usr/bin/ffmpeg') else [],
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    ext = info.get('ext', 'webm')
-                    
-                    # Check for converted mp3 first
-                    mp3_path = f"{download_folder}/{video_id}.mp3"
-                    if os.path.exists(mp3_path):
-                        return mp3_path, 'mp3', info.get('title', 'Unknown')
-                    
-                    # Check for original format
-                    original_path = f"{download_folder}/{video_id}.{ext}"
-                    if os.path.exists(original_path):
-                        return original_path, ext, info.get('title', 'Unknown')
-                    
-                    # Check any file with video_id
-                    for file in glob.glob(f"{download_folder}/{video_id}.*"):
-                        file_ext = file.split('.')[-1]
-                        return file, file_ext, info.get('title', 'Unknown')
-                        
-                    return None, None, None
-                    
-            except Exception as e:
-                logs.warning(f"Download with cookie {cookie_file} failed: {e}")
-                continue
-        
-        return None, None, None
-    
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, sync_download)
 
 class Streamer:
     def __init__(self):
         self.chunk_size = 1 * 1024 * 1024
 
     async def stream_local_file(self, file_path):
-        """Stream local file"""
         try:
             with open(file_path, "rb") as f:
                 while chunk := f.read(self.chunk_size):
@@ -330,15 +287,18 @@ class Streamer:
             logs.error(f"Stream error: {e}")
 
     async def get_total_chunks(self, file_url):  
-        async with httpx.AsyncClient() as client:  
+        async with httpx.AsyncClient(timeout=10) as client:
             response = await client.head(file_url)  
             file_size = response.headers.get("Content-Length")  
             return (int(file_size) + self.chunk_size - 1) // self.chunk_size if file_size else None  
 
     async def fetch_chunk(self, file_url, chunk_id):  
         start_byte = chunk_id * self.chunk_size  
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:  
-            headers = {"Range": f"bytes={start_byte}-{start_byte + self.chunk_size - 1}", "User-Agent": "Mozilla/5.0"}  
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+            headers = {  
+                "Range": f"bytes={start_byte}-{start_byte + self.chunk_size - 1}",  
+                "User-Agent": "Mozilla/5.0"  
+            }  
             response = await client.get(file_url, headers=headers)  
             return response.content if response.status_code in {206, 200} else None  
 
@@ -370,19 +330,13 @@ class Streamer:
                     if missing_chunk:  
                         yield missing_chunk
 
-def extract_video_id(text: str) -> str:
-    match = re.search(r'(?:v=|/(?:embed|v|shorts|live)/|youtu.be/)([A-Za-z0-9_-]{11})', text)
-    if match:
-        return match.group(1)
-    return text
-
 @app.get("/youtube")
 async def get_youtube_info(id: str, video: bool = False, user: str = Security(get_user)):
     try:
         video_id = extract_video_id(id)
         logs.info(f"Processing: {video_id} (video={video})")
         
-        # For VIDEO requests - always use direct stream, no Drive
+        # VIDEO REQUEST - Direct stream only
         if video:
             url = await get_youtube_url(id)
             metadata = await extract_metadata(url, video=True)
@@ -390,8 +344,8 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             if not metadata or not metadata.get("stream_url"):
                 return {"error": "Could not fetch video info"}
             
-            file_url = metadata.get("stream_url")
             extension = metadata.get("ext", "mp4")
+            file_url = metadata.get("stream_url")
             file_name = f"{video_id}.{extension}"
             
             ip = await get_public_ip()
@@ -400,7 +354,7 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             
             database[stream_id] = {
                 "file_url": file_url, 
-                "file_name": file_name, 
+                "file_name": file_name,
                 "is_local": False
             }
             logs.info(f"Video stream setup: {stream_id}")
@@ -418,31 +372,27 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                 "source": "direct_stream"
             }
         
-        # For AUDIO requests - check Drive first
+        # AUDIO REQUEST - Check Drive first
         api_metadata = load_metadata()
+        download_folder = "downloads"
+        os.makedirs(download_folder, exist_ok=True)
         
-        # Check if video_id exists in metadata
+        # Check if in Drive metadata
         if video_id in api_metadata and DRIVE_AVAILABLE:
             metadata_entry = api_metadata[video_id]
             drive_file_id = metadata_entry.get("drive_file_id")
             file_format = metadata_entry.get("format", "mp3")
-            
-            download_folder = "downloads"
-            os.makedirs(download_folder, exist_ok=True)
             local_path = f"{download_folder}/{video_id}.{file_format}"
             
-            # Download from Drive if not in local
+            # Check local first
             if not os.path.exists(local_path):
                 logs.info(f"Downloading from Drive: {video_id}")
                 if not download_from_drive(drive_file_id, local_path):
-                    logs.error(f"Drive download failed for {video_id}")
-                    # Remove from metadata if download fails
+                    logs.warning(f"Drive download failed, will re-download: {video_id}")
                     del api_metadata[video_id]
                     save_metadata(api_metadata)
-                else:
-                    logs.info(f"Successfully downloaded from Drive: {video_id}")
             
-            # If file exists locally now, stream it
+            # If file exists, stream it
             if os.path.exists(local_path):
                 ip = await get_public_ip()
                 stream_id = await new_uid()
@@ -453,7 +403,7 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                     "file_name": f"{video_id}.{file_format}",
                     "is_local": True
                 }
-                logs.info(f"Streaming from Drive cache: {stream_id}")
+                logs.info(f"Streaming from Drive: {stream_id}")
                 
                 url = f"https://www.youtube.com/watch?v={video_id}"
                 yt_metadata = await extract_metadata(url, video=False)
@@ -471,19 +421,57 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                     "source": "drive"
                 }
         
-        # If not in Drive metadata or Drive not available, download with yt-dlp
-        logs.info(f"Not found in Drive, downloading: {video_id}")
+        # Not in Drive - Download with yt-dlp
+        logs.info(f"Not in Drive, downloading: {video_id}")
         url = await get_youtube_url(id)
         cookie_files = get_cookie_files()
         
-        # Download the audio file
-        downloaded_file, file_format, title = await download_audio_with_ytdlp(url, video_id, cookie_files)
+        downloaded_file = None
+        file_format = None
+        title = "Unknown"
+        
+        for cookie_file in cookie_files:
+            try:
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": f"{download_folder}/{video_id}.%(ext)s",
+                    "geo_bypass": True,
+                    "nocheckcertificate": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "cookiefile": cookie_file,
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    ext = info.get('ext', 'webm')
+                    title = info.get('title', 'Unknown')
+                    
+                    # Check for downloaded file
+                    expected_path = f"{download_folder}/{video_id}.{ext}"
+                    if os.path.exists(expected_path):
+                        downloaded_file = expected_path
+                        file_format = ext
+                        logs.info(f"Successfully downloaded: {downloaded_file}")
+                        break
+                    
+                    # Check any file with video_id
+                    for file in glob.glob(f"{download_folder}/{video_id}.*"):
+                        downloaded_file = file
+                        file_format = file.split('.')[-1]
+                        logs.info(f"Found downloaded file: {downloaded_file}")
+                        break
+                    
+                    if downloaded_file:
+                        break
+                        
+            except Exception as e:
+                logs.warning(f"Download with cookie {cookie_file} failed: {e}")
+                continue
         
         if not downloaded_file or not os.path.exists(downloaded_file):
             logs.error(f"Download failed for {video_id}")
             return {"error": "Download failed"}
-        
-        logs.info(f"Downloaded: {downloaded_file}")
         
         # Upload to Drive in background
         if DRIVE_AVAILABLE:
@@ -491,7 +479,6 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             drive_file_id = upload_to_drive(downloaded_file, video_id, file_format)
             
             if drive_file_id:
-                # Update metadata
                 api_metadata[video_id] = {
                     "drive_file_id": drive_file_id,
                     "uploaded_at": datetime.now().isoformat(),
@@ -502,7 +489,7 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                 save_metadata(api_metadata)
                 logs.info(f"Added to metadata: {video_id}")
         
-        # Stream the downloaded file
+        # Stream the file
         ip = await get_public_ip()
         stream_id = await new_uid()
         stream_url = f"http://{ip}:8000/stream/{stream_id}"
@@ -553,7 +540,7 @@ async def stream_from_stream_url(stream_id: str):
             logs.error(f"File not found: {file_path}")
             return {"error": "File not found!"}
         
-        media_type = "audio/mpeg" if file_name.endswith('.mp3') else "audio/webm" if file_name.endswith('.webm') else "video/mp4"
+        media_type = "audio/mpeg" if file_name.endswith('.mp3') else "audio/webm" if file_name.endswith('.webm') else "application/octet-stream"
         headers = {"Content-Disposition": f"attachment; filename=\"{file_name}\""}
         
         return StreamingResponse(
@@ -570,11 +557,10 @@ async def stream_from_stream_url(stream_id: str):
         return {"error": "Invalid stream request!"}
 
     try:  
-        media_type = "video/mp4" if file_name.endswith('.mp4') else "application/octet-stream"
         headers = {"Content-Disposition": f"attachment; filename=\"{file_name}\""}  
         return StreamingResponse(
             streamer.stream_file(file_url), 
-            media_type=media_type, 
+            media_type="application/octet-stream", 
             headers=headers
         )  
     except Exception as e:  
