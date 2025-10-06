@@ -41,6 +41,7 @@ API_KEY = "ShrutiMusic"
 CLIENT_SECRET_PATH = "client_secret.json"
 TOKEN_PATH = "token.json"
 DRIVE_CACHE_PATH = "drive_cache.json"
+DRIVE_METADATA_FILE = "api_metadata.json"
 DRIVE_FOLDER_ID = None
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
@@ -178,46 +179,153 @@ def download_from_drive(drive_file_id, dest_path):
         logs.error(f"Drive download failed: {e}")
         return False
 
-def upload_to_drive(file_path, video_id):
+def upload_to_drive(file_path, video_id, title, file_format, file_size):
     service = get_drive_service()
     if not service or not os.path.exists(file_path):
         return None
     
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    file_size_mb = file_size / (1024 * 1024)
     if file_size_mb > 120:
         return None
         
     try:
-        file_metadata = {"name": f"{video_id}.mp3"}
+        file_metadata = {"name": f"{video_id}.{file_format}"}
         if DRIVE_FOLDER_ID:
             file_metadata["parents"] = [DRIVE_FOLDER_ID]
         
         media = MediaFileUpload(file_path, resumable=True)
         file = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-        return file.get("id")
+        drive_file_id = file.get("id")
+        
+        # Update metadata
+        if drive_file_id:
+            update_drive_metadata(video_id, drive_file_id, title, file_format, file_size)
+        
+        return drive_file_id
     except Exception as e:
         logs.error(f"Drive upload failed: {e}")
         return None
 
-def load_drive_cache():
-    if not DRIVE_AVAILABLE or not os.path.exists(DRIVE_CACHE_PATH):
+def load_drive_metadata():
+    if not DRIVE_AVAILABLE:
         return {}
+    
+    # First try to load from local file
+    if os.path.exists(DRIVE_METADATA_FILE):
+        try:
+            with open(DRIVE_METADATA_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    
+    # If local file doesn't exist, try to download from Drive
+    service = get_drive_service()
+    if not service:
+        return {}
+    
     try:
-        with open(DRIVE_CACHE_PATH, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
+        query = f"name = '{DRIVE_METADATA_FILE}' and trashed=false"
+        if DRIVE_FOLDER_ID:
+            query += f" and '{DRIVE_FOLDER_ID}' in parents"
+        
+        results = service.files().list(q=query, fields="files(id)").execute()
+        files = results.get('files', [])
+        
+        if files:
+            metadata_file_id = files[0]['id']
+            request = service.files().get_media(fileId=metadata_file_id)
+            file_content = io.BytesIO()
+            downloader = MediaIoBaseDownload(file_content, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            
+            metadata_content = file_content.getvalue().decode('utf-8')
+            metadata = json.loads(metadata_content)
+            
+            # Save locally for future use
+            with open(DRIVE_METADATA_FILE, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            return metadata
+    except Exception as e:
+        logs.error(f"Drive metadata load failed: {e}")
+    
+    return {}
 
-def save_drive_cache(cache_data):
+def save_drive_metadata(metadata):
     if not DRIVE_AVAILABLE:
         return False
+    
+    # Save locally
     try:
-        os.makedirs(os.path.dirname(DRIVE_CACHE_PATH), exist_ok=True)
-        with open(DRIVE_CACHE_PATH, 'w') as f:
-            json.dump(cache_data, f, indent=2)
-        return True
-    except:
+        with open(DRIVE_METADATA_FILE, 'w') as f:
+            json.dump(metadata, f, indent=2)
+    except Exception as e:
+        logs.error(f"Local metadata save failed: {e}")
         return False
+    
+    # Upload to Drive
+    service = get_drive_service()
+    if not service:
+        return False
+    
+    try:
+        # Check if metadata file already exists on Drive
+        query = f"name = '{DRIVE_METADATA_FILE}' and trashed=false"
+        if DRIVE_FOLDER_ID:
+            query += f" and '{DRIVE_FOLDER_ID}' in parents"
+        
+        results = service.files().list(q=query, fields="files(id)").execute()
+        files = results.get('files', [])
+        
+        file_metadata = {
+            'name': DRIVE_METADATA_FILE,
+            'mimeType': 'application/json'
+        }
+        if DRIVE_FOLDER_ID:
+            file_metadata['parents'] = [DRIVE_FOLDER_ID]
+        
+        media = MediaFileUpload(DRIVE_METADATA_FILE, resumable=True, mimetype='application/json')
+        
+        if files:
+            # Update existing file
+            file = service.files().update(
+                fileId=files[0]['id'],
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+        else:
+            # Create new file
+            file = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+        
+        return True
+    except Exception as e:
+        logs.error(f"Drive metadata upload failed: {e}")
+        return False
+
+def update_drive_metadata(video_id, drive_file_id, title, file_format, file_size):
+    metadata = load_drive_metadata()
+    
+    metadata[video_id] = {
+        "drive_file_id": drive_file_id,
+        "uploaded_at": datetime.now().isoformat(),
+        "format": file_format,
+        "file_size": file_size,
+        "title": title
+    }
+    
+    save_drive_metadata(metadata)
+    return True
+
+def get_drive_file_info(video_id):
+    metadata = load_drive_metadata()
+    return metadata.get(video_id)
 
 async def extract_metadata(url: str, video: bool = False):
     if not url:
@@ -340,7 +448,88 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
         video_id = extract_video_id(id)
         logs.info(f"Processing: {video_id} (video={video})")
         
+        # VIDEO REQUEST: Always use direct streaming (no Drive)
+        if video:
+            url = await get_youtube_url(id)
+            metadata = await extract_metadata(url, video)
+            
+            if not metadata:
+                logs.error(f"Metadata extraction failed for {video_id}")
+                return {"error": "Could not fetch video info"}
+
+            file_url = metadata.get("stream_url")
+            
+            if file_url:
+                file_extension = "mp4"
+                file_name = f"{metadata.get('id')}.{file_extension}"
+                
+                ip = await get_public_ip()  
+                stream_id = await new_uid()  
+                stream_url = f"http://{ip}:8000/stream/{stream_id}"  
+                database[stream_id] = {"file_url": file_url, "file_name": file_name, "is_local": False}  
+                logs.info(f"Database set for {stream_id}: video stream URL")
+                logs.info(f"Total database entries: {len(database)}")
+
+                return {  
+                    "id": metadata.get("id"),  
+                    "title": metadata.get("title"),  
+                    "duration": metadata.get("duration"),  
+                    "link": metadata.get("link"),  
+                    "channel": metadata.get("channel"),  
+                    "views": metadata.get("views"),  
+                    "thumbnail": metadata.get("thumbnail"),  
+                    "stream_url": stream_url,  
+                    "stream_type": metadata.get("stream_type"),
+                    "source": "stream"
+                }
+            else:
+                return {"error": "No stream URL available for video"}
+        
+        # AUDIO REQUEST: Check Drive first, then stream/download
         if not video and DRIVE_AVAILABLE:
+            # Check if file exists in Drive metadata
+            drive_file_info = get_drive_file_info(video_id)
+            if drive_file_info:
+                logs.info(f"Found in Drive metadata: {video_id}")
+                
+                download_folder = "downloads"
+                os.makedirs(download_folder, exist_ok=True)
+                local_path = f"{download_folder}/{video_id}.{drive_file_info['format']}"
+                
+                # Download from Drive if not exists locally
+                if not os.path.exists(local_path):
+                    if download_from_drive(drive_file_info['drive_file_id'], local_path):
+                        logs.info(f"Downloaded from Drive: {video_id}")
+                    else:
+                        logs.error(f"Failed to download from Drive: {video_id}")
+                        drive_file_info = None
+                
+                if drive_file_info and os.path.exists(local_path):
+                    ip = await get_public_ip()
+                    stream_id = await new_uid()
+                    stream_url = f"http://{ip}:8000/stream/{stream_id}"
+                    
+                    database[stream_id] = {"file_path": local_path, "file_name": f"{video_id}.{drive_file_info['format']}", "is_local": True}
+                    logs.info(f"Database set for {stream_id}: drive file")
+                    logs.info(f"Total database entries: {len(database)}")
+                    
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    metadata = await extract_metadata(url, video)
+                    
+                    return {
+                        "id": video_id,
+                        "title": drive_file_info.get("title", metadata.get("title", "Unknown")),
+                        "duration": metadata.get("duration", 0),
+                        "link": url,
+                        "channel": metadata.get("channel", "Unknown"),
+                        "views": metadata.get("views", 0),
+                        "thumbnail": metadata.get("thumbnail", ""),
+                        "stream_url": stream_url,
+                        "stream_type": "Audio",
+                        "source": "drive"
+                    }
+            
+            # Check local downloads
             download_folder = "downloads"
             os.makedirs(download_folder, exist_ok=True)
             
@@ -358,6 +547,11 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                     url = f"https://www.youtube.com/watch?v={video_id}"
                     metadata = await extract_metadata(url, video)
                     
+                    # Upload to Drive in background if not already there
+                    if DRIVE_AVAILABLE and not get_drive_file_info(video_id):
+                        file_size = os.path.getsize(local_path)
+                        asyncio.create_task(upload_to_drive_async(local_path, video_id, metadata.get("title", "Unknown"), ext, file_size))
+                    
                     return {
                         "id": video_id,
                         "title": metadata.get("title", "Unknown"),
@@ -370,40 +564,8 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                         "stream_type": "Audio",
                         "source": "local"
                     }
-            
-            drive_file_id = search_drive_by_video_id(video_id)
-            if drive_file_id:
-                local_path = f"{download_folder}/{video_id}.mp3"
-                if download_from_drive(drive_file_id, local_path):
-                    ip = await get_public_ip()
-                    stream_id = await new_uid()
-                    stream_url = f"http://{ip}:8000/stream/{stream_id}"
-                    
-                    database[stream_id] = {"file_path": local_path, "file_name": f"{video_id}.mp3", "is_local": True}
-                    logs.info(f"Database set for {stream_id}: drive file")
-                    logs.info(f"Total database entries: {len(database)}")
-                    
-                    url = f"https://www.youtube.com/watch?v={video_id}"
-                    metadata = await extract_metadata(url, video)
-                    
-                    cache = load_drive_cache()
-                    if video_id not in cache:
-                        cache[video_id] = {"drive_file_id": drive_file_id, "uploaded_at": datetime.now().isoformat()}
-                        save_drive_cache(cache)
-                    
-                    return {
-                        "id": video_id,
-                        "title": metadata.get("title", "Unknown"),
-                        "duration": metadata.get("duration", 0),
-                        "link": url,
-                        "channel": metadata.get("channel", "Unknown"),
-                        "views": metadata.get("views", 0),
-                        "thumbnail": metadata.get("thumbnail", ""),
-                        "stream_url": stream_url,
-                        "stream_type": "Audio",
-                        "source": "drive"
-                    }
         
+        # Direct streaming for audio (when not in Drive and not locally downloaded)
         url = await get_youtube_url(id)
         metadata = await extract_metadata(url, video)
         
@@ -414,12 +576,14 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
         file_url = metadata.get("stream_url")
         
         if file_url:
-            file_name = f"{metadata.get('id')}.{extention}"  
+            file_extension = "mp3"
+            file_name = f"{metadata.get('id')}.{file_extension}"
+            
             ip = await get_public_ip()  
             stream_id = await new_uid()  
             stream_url = f"http://{ip}:8000/stream/{stream_id}"  
             database[stream_id] = {"file_url": file_url, "file_name": file_name, "is_local": False}  
-            logs.info(f"Database set for {stream_id}: stream URL")
+            logs.info(f"Database set for {stream_id}: audio stream URL")
             logs.info(f"Total database entries: {len(database)}")
 
             return {  
@@ -435,15 +599,17 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                 "source": "stream"
             }
         else:
+            # Download audio and upload to Drive
             download_folder = "downloads"
             os.makedirs(download_folder, exist_ok=True)
             cookie_files = get_cookie_files()
             downloaded_file = None
+            downloaded_format = None
             
             for cookie_file in cookie_files:
                 try:
                     ydl_opts = {
-                        "format": "bestaudio/best" if not video else "best[height<=?720][width<=?1280]",
+                        "format": "bestaudio/best",
                         "outtmpl": f"{download_folder}/{video_id}.%(ext)s",
                         "geo_bypass": True,
                         "nocheckcertificate": True,
@@ -454,26 +620,19 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                     
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=False)
-                        expected_ext = info.get('ext', 'mp3' if not video else 'mp4')
+                        expected_ext = info.get('ext', 'mp3')
                         expected_path = f"{download_folder}/{video_id}.{expected_ext}"
                         
                         if os.path.exists(expected_path):
                             downloaded_file = expected_path
+                            downloaded_format = expected_ext
                             break
                         
                         ydl.download([url])
                         
                         if os.path.exists(expected_path):
                             downloaded_file = expected_path
-                            
-                            if not video and DRIVE_AVAILABLE:
-                                file_size_mb = os.path.getsize(expected_path) / (1024 * 1024)
-                                if file_size_mb <= 120:
-                                    drive_id = upload_to_drive(expected_path, video_id)
-                                    if drive_id:
-                                        cache = load_drive_cache()
-                                        cache[video_id] = {"drive_file_id": drive_id, "uploaded_at": datetime.now().isoformat()}
-                                        save_drive_cache(cache)
+                            downloaded_format = expected_ext
                             break
                             
                 except Exception as e:
@@ -489,6 +648,11 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                 logs.info(f"Database set for {stream_id}: downloaded file")
                 logs.info(f"Total database entries: {len(database)}")
                 
+                # Upload to Drive in background
+                if DRIVE_AVAILABLE:
+                    file_size = os.path.getsize(downloaded_file)
+                    asyncio.create_task(upload_to_drive_async(downloaded_file, video_id, metadata.get("title", "Unknown"), downloaded_format, file_size))
+                
                 return {
                     "id": video_id,
                     "title": metadata.get("title", "Unknown"),
@@ -498,7 +662,7 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
                     "views": metadata.get("views", 0),
                     "thumbnail": metadata.get("thumbnail", ""),
                     "stream_url": stream_url,
-                    "stream_type": "Video" if video else "Audio",
+                    "stream_type": "Audio",
                     "source": "download"
                 }
             
@@ -506,7 +670,18 @@ async def get_youtube_info(id: str, video: bool = False, user: str = Security(ge
             
     except Exception as e:  
         logs.error(f"Error: {e}")  
-        return {}
+        return {"error": str(e)}
+
+async def upload_to_drive_async(file_path, video_id, title, file_format, file_size):
+    """Upload file to Drive in background"""
+    try:
+        drive_file_id = upload_to_drive(file_path, video_id, title, file_format, file_size)
+        if drive_file_id:
+            logs.info(f"Successfully uploaded to Drive: {video_id}")
+        else:
+            logs.warning(f"Failed to upload to Drive: {video_id}")
+    except Exception as e:
+        logs.error(f"Background upload failed: {e}")
 
 @app.get("/stream/{stream_id}")
 async def stream_from_stream_url(stream_id: str):
@@ -527,7 +702,7 @@ async def stream_from_stream_url(stream_id: str):
             return {"error": "File not found!"}
         
         streamer = Streamer()
-        media_type = "audio/mpeg" if file_name.endswith('.mp3') else "video/mp4"
+        media_type = "audio/mpeg" if file_name.endswith('.mp3') else "audio/mp4" if file_name.endswith('.m4a') else "audio/webm"
         headers = {"Content-Disposition": f"attachment; filename=\"{file_name}\""}
         
         return StreamingResponse(streamer.stream_local_file(file_path), media_type=media_type, headers=headers)
@@ -552,6 +727,9 @@ async def startup_event():
         service = get_drive_service()
         if service:
             logs.info("Drive ready")
+            # Load metadata on startup
+            metadata = load_drive_metadata()
+            logs.info(f"Loaded {len(metadata)} entries from Drive metadata")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
